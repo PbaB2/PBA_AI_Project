@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-
+import re
 
 REQUIRED_SLOTS = [
     "party_purpose",
@@ -16,6 +16,63 @@ REQUIRED_SLOTS = [
     "finish_preference",
 ]
 
+NEGATIVE_CUES = ["싫", "안 좋아", "별로", "부담", "빼고", "제외", "피하고"]
+POSITIVE_CUES = ["좋아", "좋고", "좋겠", "원해", "선호", "괜찮"]
+
+AROMA_KEYWORDS = {
+    "민트향": "민트향",
+    "민트": "민트향",
+    "과일향": "과일향",
+    "과일": "과일향",
+    "우디향": "우디향",
+    "우디": "우디향",
+    "커피향": "커피향",
+    "커피": "커피향",
+    "시트러스향": "시트러스향",
+    "시트러스": "시트러스향",
+    "허브향": "허브향",
+    "허브": "허브향",
+}
+
+TASTE_KEYWORDS = {
+    "상큼": "상큼함",
+    "달콤": "단맛",
+    "단맛": "단맛",
+    "청량": "청량함",
+    "고소": "고소함",
+    "스파이시": "스파이시",
+    "매콤": "스파이시",
+    "밀키": "밀키함",
+    "부드러운": "밀키함",
+    "쓴맛": "쓴맛",
+    "쌉쌀": "쓴맛",
+    "신맛": "신맛",
+}
+
+BASE_KEYWORDS = {
+    "위스키": "위스키",
+    "럼": "럼",
+    "진": "진",
+    "데킬라": "데킬라",
+    "보드카": "보드카",
+}
+
+
+def split_clauses(text: str) -> list[str]:
+    parts = re.split(r"[.!?]|,| 그리고 | 근데 | 하지만 | 다만 | 그런데 ", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def is_negative_clause(clause: str) -> bool:
+    return any(cue in clause for cue in NEGATIVE_CUES)
+
+
+def collect_tags(clause: str, keyword_map: dict[str, str]) -> list[str]:
+    found = []
+    for keyword, tag in keyword_map.items():
+        if keyword in clause and tag not in found:
+            found.append(tag)
+    return found
 
 def _is_filled(value: Any) -> bool:
     if value is None:
@@ -75,19 +132,33 @@ def extract_slots_from_korean_text(user_msg: str, current_slots: dict) -> dict:
         extracted["current_mood"] = "스트레스"
 
     # 3. 선호 맛
+    # 3~9. 맛 / 향 / 베이스는 절 단위로 긍정/부정 판별
     preferred_tastes = []
-    if "상큼" in text:
-        preferred_tastes.append("상큼함")
-    if "달콤" in text or "단맛" in text:
-        preferred_tastes.append("단맛")
-    if "청량" in text:
-        preferred_tastes.append("청량함")
-    if "고소" in text:
-        preferred_tastes.append("고소함")
-    if "스파이시" in text or "매콤" in text:
-        preferred_tastes.append("스파이시")
-    if "밀키" in text or "부드러운" in text:
-        preferred_tastes.append("밀키함")
+    disliked_tastes = []
+    preferred_aromas = []
+    disliked_aromas = []
+    disliked_bases = []
+
+    clauses = split_clauses(text)
+
+    for clause in clauses:
+        neg = is_negative_clause(clause)
+
+        taste_tags = collect_tags(clause, TASTE_KEYWORDS)
+        aroma_tags = collect_tags(clause, AROMA_KEYWORDS)
+        base_tags = collect_tags(clause, BASE_KEYWORDS)
+
+        if neg:
+            disliked_tastes = _merge_list_slot(disliked_tastes, taste_tags)
+            disliked_aromas = _merge_list_slot(disliked_aromas, aroma_tags)
+            disliked_bases = _merge_list_slot(disliked_bases, base_tags)
+        else:
+            preferred_tastes = _merge_list_slot(preferred_tastes, taste_tags)
+            preferred_aromas = _merge_list_slot(preferred_aromas, aroma_tags)
+
+    # 비선호가 우선
+    preferred_tastes = [x for x in preferred_tastes if x not in disliked_tastes]
+    preferred_aromas = [x for x in preferred_aromas if x not in disliked_aromas]
 
     if preferred_tastes:
         extracted["preferred_tastes"] = _merge_list_slot(
@@ -95,35 +166,11 @@ def extract_slots_from_korean_text(user_msg: str, current_slots: dict) -> dict:
             preferred_tastes,
         )
 
-    # 4. 비선호 맛
-    disliked_tastes = []
-    if "쓴 맛 싫" in text or "너무 쓰" in text:
-        disliked_tastes.append("쓴맛")
-    if "너무 달" in text or "단 거 싫" in text:
-        disliked_tastes.append("단맛")
-    if "신 거 싫" in text:
-        disliked_tastes.append("신맛")
-
     if disliked_tastes:
         extracted["disliked_tastes"] = _merge_list_slot(
             current_slots.get("disliked_tastes"),
             disliked_tastes,
         )
-
-    # 5. 선호 향
-    preferred_aromas = []
-    if "민트" in text:
-        preferred_aromas.append("민트향")
-    if "과일향" in text or "과일" in text:
-        preferred_aromas.append("과일향")
-    if "우디" in text:
-        preferred_aromas.append("우디향")
-    if "커피향" in text or "커피" in text:
-        preferred_aromas.append("커피향")
-    if "시트러스" in text:
-        preferred_aromas.append("시트러스향")
-    if "허브" in text:
-        preferred_aromas.append("허브향")
 
     if preferred_aromas:
         extracted["preferred_aromas"] = _merge_list_slot(
@@ -131,49 +178,11 @@ def extract_slots_from_korean_text(user_msg: str, current_slots: dict) -> dict:
             preferred_aromas,
         )
 
-    # 6. 비선호 향
-    disliked_aromas = []
-    if "민트향 싫" in text:
-        disliked_aromas.append("민트향")
-    if "커피향 싫" in text:
-        disliked_aromas.append("커피향")
-    if "우디향 싫" in text:
-        disliked_aromas.append("우디향")
-
     if disliked_aromas:
         extracted["disliked_aromas"] = _merge_list_slot(
             current_slots.get("disliked_aromas"),
             disliked_aromas,
         )
-
-    # 7. 도수 선호
-    if "술 잘 마셔" in text or "센 거 좋아" in text or "도수 높은" in text:
-        extracted["strength_preference"] = "강함"
-    elif "술 못 마셔" in text or "약한 거" in text or "도수 낮은" in text:
-        extracted["strength_preference"] = "약함"
-    elif "적당한" in text or "중간 정도" in text:
-        extracted["strength_preference"] = "중간"
-
-    # 8. 평소 좋아하는 음료
-    if "모히토" in text:
-        extracted["favorite_drinks"] = "모히토"
-    elif "하이볼" in text:
-        extracted["favorite_drinks"] = "하이볼"
-    elif "마가리타" in text:
-        extracted["favorite_drinks"] = "마가리타"
-
-    # 9. 싫어하는 베이스
-    disliked_bases = []
-    if "위스키 싫" in text:
-        disliked_bases.append("위스키")
-    if "럼 싫" in text:
-        disliked_bases.append("럼")
-    if "진 싫" in text:
-        disliked_bases.append("진")
-    if "데킬라 싫" in text:
-        disliked_bases.append("데킬라")
-    if "보드카 싫" in text:
-        disliked_bases.append("보드카")
 
     if disliked_bases:
         extracted["disliked_bases"] = _merge_list_slot(
@@ -188,6 +197,18 @@ def extract_slots_from_korean_text(user_msg: str, current_slots: dict) -> dict:
         extracted["finish_preference"] = "달콤함"
     elif "가벼운 끝맛" in text:
         extracted["finish_preference"] = "가벼움"
+        
+    if "preferred_aromas" in extracted and "disliked_aromas" in extracted:
+        extracted["preferred_aromas"] = [
+            x for x in extracted["preferred_aromas"]
+            if x not in extracted["disliked_aromas"]
+        ]
+
+    if "preferred_tastes" in extracted and "disliked_tastes" in extracted:
+        extracted["preferred_tastes"] = [
+            x for x in extracted["preferred_tastes"]
+            if x not in extracted["disliked_tastes"]
+        ]
 
     return extracted
 

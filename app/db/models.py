@@ -276,7 +276,7 @@ class Ingredient(Base):
     __tablename__ = "ingredients"
 
     ingredient_id = Column(Integer, primary_key=True, autoincrement=True)
-    name_kr = Column(String(100), nullable=False)
+    ingredients_name = Column(String(100), nullable=False)
     ingredient_type = Column(String(30), nullable=False)
     pump_no = Column(Integer, nullable=True)
     is_pumpable = Column(Boolean, nullable=True)

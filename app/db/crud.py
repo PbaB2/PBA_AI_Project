@@ -604,6 +604,24 @@ def create_brew_order(
 # 12. 평가 저장
 # ============================================================
 
+# ============================================================
+# 13. 재료 전체 로드 (추천 엔진용 N+1 방지)
+# ============================================================
+
+def get_all_recipes_with_ingredients(db: Session) -> dict[int, list[tuple]]:
+    """cocktail_id → [(Recipe, Ingredient)] 딕셔너리로 한 번에 로드"""
+    from app.db.models import Recipe, Ingredient
+    rows = (
+        db.query(Recipe, Ingredient)
+        .join(Ingredient, Recipe.ingredient_id == Ingredient.ingredient_id)
+        .all()
+    )
+    result: dict[int, list[tuple]] = {}
+    for recipe, ingredient in rows:
+        result.setdefault(recipe.cocktail_id, []).append((recipe, ingredient))
+    return result
+
+
 def create_evaluation_log(
     db: Session,
     guest_session_id: str | Any,

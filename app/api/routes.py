@@ -17,35 +17,16 @@ from app.db.crud import (
     list_dialogue_turns,
     get_preference_slot,
     update_preference_slots,
-)
-from app.utils.config import UPLOAD_DIR
-from app.agents.preference_agent import run_dialogue
-
-router = APIRouter()
-
-# 더미 칵테일 1개 넣고 테스트
-from app.agents.preference_agent import (
-    run_dialogue,
-    classify_intent,
-    update_vector,
-)
-from app.db.crud import (
-    create_party_session,
-    create_guest_session,
-    get_guest_session,
-    upsert_initial_tags,
-    save_space_analysis,
-    create_dialogue_turn,
-    list_dialogue_turns,
-    get_preference_slot,
-    update_preference_slots,
     get_preference_vector,
-    create_sample_recommendation,
-    get_latest_space_analysis_by_party,
     create_sample_feedback,
     update_preference_vector,
     get_latest_sample_recommendation_by_guest,
 )
+from app.utils.config import UPLOAD_DIR
+from app.agents.preference_agent import run_dialogue, classify_intent, update_vector
+from app.agents.orchestration_agent import run_recommendation
+
+router = APIRouter()
 
 
 # ============================================================
@@ -71,13 +52,6 @@ class InitialTagRequest(BaseModel):
 
 class DialogueRequest(BaseModel):
     message: str
-
-# 더미 칵테일 테스트
-class SampleRecommendRequest(BaseModel):
-    recommended_cocktail_id: int
-    recommendation_reason: str
-    rag_retrieved_ids_json: list[int] = Field(default_factory=list)
-    recipe_snapshot_json: dict = Field(default_factory=dict)
 
 
 class FeedbackRequest(BaseModel):
@@ -147,45 +121,37 @@ def healthcheck():
     return {"status": "ok"}
 
 
-# 더미 칵테일 테스트 - 샘플 추천
+# ============================================================
+# 추천
+# ============================================================
 
 @router.post("/sessions/{gid}/recommend-sample")
 def recommend_sample_endpoint(
     gid: str,
-    req: SampleRecommendRequest,
     db: Session = Depends(get_db),
 ):
     guest = get_guest_session(db, gid)
     if not guest:
         raise HTTPException(status_code=404, detail="guest_session_id not found")
 
-    latest_space = get_latest_space_analysis_by_party(db, guest.party_session_id)
-    if not latest_space:
-        raise HTTPException(status_code=404, detail="space_analysis not found")
+    result = run_recommendation(db, gid, k=3)
 
-    row = create_sample_recommendation(
-        db=db,
-        guest_session_id=gid,
-        space_analysis_id=latest_space.space_analysis_id,
-        recommended_cocktail_id=req.recommended_cocktail_id,
-        recommendation_reason=req.recommendation_reason,
-        rag_retrieved_ids_json=req.rag_retrieved_ids_json,
-        recipe_snapshot_json=req.recipe_snapshot_json,
-    )
+    # 1) 공간 이미지 없음
+    if result.get("status") == "need_space_image":
+        return result
 
-    return {
-        "status": "ok",
-        "sample_recommendation_id": str(row.sample_recommendation_id),
-        "guest_session_id": str(row.guest_session_id),
-        "space_analysis_id": str(row.space_analysis_id),
-        "recommended_cocktail_id": row.recommended_cocktail_id,
-        "recommendation_reason": row.recommendation_reason,
-        "rag_retrieved_ids_json": row.rag_retrieved_ids_json,
-        "recipe_snapshot_json": row.recipe_snapshot_json,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
-    }
+    # 2) 정보 부족
+    if result.get("status") == "need_more_info":
+        return result
 
-# 더미 칵테일 테스트 - 피드백
+    # 3) 후보 없음
+    if result.get("status") == "no_candidates":
+        return result
+
+    # 4) 정상 추천
+    return result
+
+
 @router.post("/sessions/{gid}/feedback")
 def feedback_endpoint(
     gid: str,
