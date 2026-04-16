@@ -1,0 +1,50 @@
+# ================================================================
+#  AI 칵테일 추천 시스템 — requirements.txt
+#  Python 3.10.19  |  CUDA 13.0 (cu124 빌드 사용)
+#
+#  ⚠ torch는 아래 명령으로 별도 설치 (일반 pip install 안 됨)
+#  pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+#      --index-url https://download.pytorch.org/whl/cu124
+#
+#  그 다음 나머지 패키지 설치:
+#  pip install -r requirements.txt
+# ================================================================
+
+# ── 웹 프레임워크 ────────────────────────────────────────────────
+fastapi==0.128.0
+uvicorn[standard]==0.40.0
+python-multipart==0.0.22
+
+# ── DB ──────────────────────────────────────────────────────────
+sqlalchemy==2.0.30
+psycopg2-binary==2.9.9
+pgvector==0.2.5
+
+# ── AI / ML (torch는 위 명령으로 별도 설치) ─────────────────────
+# torch==2.5.1        ← pip install 따로
+# torchvision==0.20.1 ← pip install 따로
+# torchaudio==2.5.1   ← pip install 따로
+transformers==4.43.3
+accelerate==0.31.0
+einops==0.8.0
+timm==0.9.16
+qwen-vl-utils==0.0.8
+bitsandbytes==0.43.1
+
+# ── 평가 ────────────────────────────────────────────────────────
+# ragas==0.1.14  ← 평가 단계에서 설치
+datasets==2.20.0
+
+# ── 유틸 ────────────────────────────────────────────────────────
+pandas==1.5.3
+Pillow==12.1.1
+python-dotenv==1.2.1
+pydantic==2.12.5
+numpy==1.23.5
+tqdm==4.66.4
+scikit-learn==1.7.2
+matplotlib==3.7.0
+
+# ── 타 LLM 비교 평가 (선택) ─────────────────────────────────────
+openai==1.35.7
+google-generativeai==0.7.2
