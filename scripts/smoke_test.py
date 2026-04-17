@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from PIL import Image
 
-BASE = "http://localhost:8000/api/v1"
+BASE = "http://141.223.140.32:8000/api/v1"
 
 
 def expect_ok(resp, step_name):
