@@ -17,6 +17,7 @@ from app.db.crud import (
     create_final_recommendation,
     update_preference_vector,
     list_feedbacks_by_sample_recommendation,
+    list_recommended_cocktail_ids_by_guest,
 )
 from app.agents.preference_agent import classify_intent, update_vector
 from app.agents.output_agent import generate_recipe_snapshot
@@ -390,24 +391,28 @@ def run_recommendation(
     guest_session_id: str,
     k: int = 3,
     exclude_ids: Optional[list[int]] = None,
+    force: bool = False,          # ← 추가: 강제 진행 플래그
 ) -> dict:
     profile = build_user_profile(db, guest_session_id)
-    space = profile["space"]
+    space   = profile["space"]
 
     if not space:
-        return {
-            "status": "need_space_image",
-            "message": "공간 분석 결과가 없습니다. 이미지를 먼저 업로드해주세요.",
-        }
+        return {"status": "need_space_image",
+                "message": "공간 분석 결과가 없습니다. 이미지를 먼저 업로드해주세요."}
+
+    if not profile["vector"]:
+        return {"status": "need_vector",
+                "message": "선호 벡터가 없습니다. 초기 태그를 먼저 저장해주세요."}
 
     effective_completion = profile["effective_completion"]
-    if effective_completion < 80:
+
+    # force=True이면 80% 미만이어도 진행
+    if effective_completion < 80 and not force:
         return {
             "status": "need_more_info",
             "completion": effective_completion,
             "message": "아직 추천에 필요한 정보가 부족합니다.",
         }
-
     top_k = recommend_top_k(db, guest_session_id, k=k, exclude_ids=exclude_ids)
 
     if not top_k:
@@ -533,14 +538,22 @@ def process_feedback(
             "final_cocktail_id": sample_row.recommended_cocktail_id,
         }
 
-    # ADJUST → 벡터 업데이트 후 재추천
+# ADJUST → 벡터 업데이트 후 재추천
     if intent == "ADJUST":
+        all_excluded = list_recommended_cocktail_ids_by_guest(db, guest_session_id)
         rerun = run_recommendation(
             db=db,
             guest_session_id=guest_session_id,
             k=3,
-            exclude_ids=[sample_row.recommended_cocktail_id],
+            exclude_ids=all_excluded,
+            force=True,  # ← 추가
         )
+
+        # 후보 없으면 exclude 해제하고 전체에서 재추천
+        if rerun.get("status") == "no_candidates":
+            rerun = run_recommendation(db, guest_session_id, k=3,
+                                       exclude_ids=None, force=True)
+            rerun["message"] = "새로운 후보가 없어 전체 후보에서 다시 추천합니다."
 
         if rerun.get("status") != "ok":
             return {
@@ -561,12 +574,20 @@ def process_feedback(
         }
 
     # REJECT → 현재 추천 제외 후 새 후보 추천
+    all_excluded = list_recommended_cocktail_ids_by_guest(db, guest_session_id)
     rerun = run_recommendation(
         db=db,
         guest_session_id=guest_session_id,
         k=3,
-        exclude_ids=[sample_row.recommended_cocktail_id],
+        exclude_ids=all_excluded,
+        force=True,  # ← 추가
     )
+
+    # 후보 없으면 exclude 해제하고 전체에서 재추천
+    if rerun.get("status") == "no_candidates":
+        rerun = run_recommendation(db, guest_session_id, k=3,
+                                   exclude_ids=None, force=True)
+        rerun["message"] = "새로운 후보가 없어 전체 후보에서 다시 추천합니다."
 
     if rerun.get("status") != "ok":
         return {

@@ -133,6 +133,35 @@ def end_party_session(
     db.refresh(row)
     return row
 
+def update_guest_stage(
+    db: Session,
+    guest_session_id: str | Any,
+    conversation_stage: str,
+) -> Optional[GuestSession]:
+    row = get_guest_session(db, guest_session_id)
+    if not row:
+        return None
+
+    row.conversation_stage = conversation_stage
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def update_feedback_round(
+    db: Session,
+    guest_session_id: str | Any,
+    feedback_round: int,
+) -> Optional[GuestSession]:
+    row = get_guest_session(db, guest_session_id)
+    if not row:
+        return None
+
+    row.feedback_round = feedback_round
+    db.commit()
+    db.refresh(row)
+    return row
+
 
 def create_guest_session(
     db: Session,
@@ -171,6 +200,18 @@ def create_guest_session(
     db.refresh(row)
     return row
 
+def count_user_turns(
+    db: Session,
+    guest_session_id: str | Any,
+) -> int:
+    return (
+        db.query(DialogueTurn)
+        .filter(
+            DialogueTurn.guest_session_id == guest_session_id,
+            DialogueTurn.speaker_role == "USER",
+        )
+        .count()
+    )
 
 def complete_guest_session(
     db: Session,
@@ -617,6 +658,19 @@ def create_brew_order(
 # ============================================================
 # 13. 재료 전체 로드 (추천 엔진용 N+1 방지)
 # ============================================================
+
+def list_recommended_cocktail_ids_by_guest(
+    db: Session,
+    guest_session_id: str | Any,
+) -> list[int]:
+    """해당 게스트의 모든 sample_recommendation에서 추천된 칵테일 ID 목록 반환."""
+    rows = (
+        db.query(SampleRecommendation.recommended_cocktail_id)
+        .filter(SampleRecommendation.guest_session_id == guest_session_id)
+        .all()
+    )
+    return [r.recommended_cocktail_id for r in rows]
+
 
 def get_all_recipes_with_ingredients(db: Session) -> dict[int, list[tuple]]:
     """cocktail_id → [(Recipe, Ingredient)] 딕셔너리로 한 번에 로드"""

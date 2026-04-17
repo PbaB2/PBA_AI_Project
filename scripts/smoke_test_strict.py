@@ -1,10 +1,11 @@
-# scripts/smoke_test.py
-import requests
 import json
+import os
 from pathlib import Path
+
+import requests
 from PIL import Image
 
-BASE = "http://141.223.140.32:8000/api/v1"
+BASE = os.getenv("BASE_URL", "http://141.223.140.32:8000/api/v1")
 
 
 def expect_ok(resp, step_name):
@@ -27,7 +28,8 @@ def main():
     # 1. party
     r = requests.post(
         f"{BASE}/sessions/party",
-        json={"session_name": "smoke test party", "demo_mode": True},
+        json={"session_name": "strict smoke test party", "demo_mode": True},
+        timeout=20,
     )
     party_data = expect_ok(r, "party")
     party_id = party_data["party_session_id"]
@@ -36,11 +38,12 @@ def main():
     r = requests.post(
         f"{BASE}/sessions/guest",
         json={"party_session_id": party_id, "guest_label": "게스트1"},
+        timeout=20,
     )
     guest_data = expect_ok(r, "guest")
     guest_id = guest_data["guest_session_id"]
 
-    # 3. tags
+    # 3. initial tags
     r = requests.post(
         f"{BASE}/sessions/{guest_id}/tags",
         json={
@@ -49,6 +52,7 @@ def main():
             "strength": "적당히",
             "aromas": ["과일향"],
         },
+        timeout=20,
     )
     expect_ok(r, "tags")
 
@@ -63,47 +67,72 @@ def main():
         r = requests.post(
             f"{BASE}/sessions/{guest_id}/space-image",
             files={"file": ("test.jpg", f, "image/jpeg")},
+            timeout=20,
         )
     expect_ok(r, "space-image")
 
-    # 4-1. start dialogue (LLM first)
-    r = requests.post(f"{BASE}/sessions/{guest_id}/start-dialogue")
+    # 5. LLM first question
+    r = requests.post(f"{BASE}/sessions/{guest_id}/start-dialogue", timeout=20)
     start_data = expect_ok(r, "start-dialogue")
     print("첫 질문:", start_data.get("question"))
 
-    # 5. dialogue turns
+    # 6. strict slot-filling dialogue
     messages = [
-        "생일파티인데 달콤한 게 좋아요",
-        "기분은 엄청 좋고 과일향 나는 칵테일이면 좋겠어요",
-        "도수는 적당한 편이 좋고 민트향은 싫어요. 끝맛은 깔끔했으면 좋겠어요",
-        "이제 추천해줘"
+        "생일파티예요",
+        "기분이 신나요",
+        "단맛이 좋아요",
+        "위스키는 싫어요",
+        "적당히 마시고 싶어요",
+        "모히토를 좋아해요",
+        "끝맛은 깔끔하게 좋겠어요",
+        "과일향 좋아요"
     ]
 
     last_dialogue = None
+
     for idx, msg in enumerate(messages, start=1):
+        print(f"\n[USER-{idx}] {msg}")
         r = requests.post(
             f"{BASE}/sessions/{guest_id}/dialogue",
             json={"message": msg},
+            timeout=20,
         )
         last_dialogue = expect_ok(r, f"dialogue-{idx}")
 
-        if last_dialogue.get("status") in ["proceed_to_recommendation", "max_turns_reached"]:
+        status = last_dialogue.get("status")
+        if status in ["proceed_to_recommendation", "max_turns_reached"]:
             break
         if last_dialogue.get("should_proceed", False):
             break
 
-    print("마지막 질문:", last_dialogue.get("question"))
+    if last_dialogue is None:
+        raise RuntimeError("dialogue result is empty")
+
+    print("\n=== dialogue summary ===")
+    print("status:", last_dialogue.get("status"))
     print("completion:", last_dialogue.get("completion"))
     print("should_proceed:", last_dialogue.get("should_proceed"))
 
-    # 6. recommendation
-    if not last_dialogue.get("should_proceed", False):
-        print("아직 정보 부족해서 추천 호출 안 함")
-        return
+    if last_dialogue.get("status") not in ["proceed_to_recommendation", "max_turns_reached"] \
+       and not last_dialogue.get("should_proceed", False):
+        raise RuntimeError(
+            "strict smoke test failed: 80% completion or proceed condition not reached"
+        )
 
-    r = requests.post(f"{BASE}/sessions/{guest_id}/recommend-sample")
+    # 7. recommendation (strict: no force)
+    r = requests.post(
+        f"{BASE}/sessions/{guest_id}/recommend-sample",
+        timeout=20,
+    )
     rec_data = expect_ok(r, "recommend-sample")
-    print("추천 결과:", json.dumps(rec_data, ensure_ascii=False, indent=2))
+
+    if rec_data.get("status") != "ok":
+        raise RuntimeError(f"recommendation failed in strict mode: {rec_data}")
+
+    print("\n=== strict recommendation result ===")
+    print(json.dumps(rec_data, ensure_ascii=False, indent=2))
+
+    print("\n[PASS] strict slot smoke test completed")
 
 
 if __name__ == "__main__":

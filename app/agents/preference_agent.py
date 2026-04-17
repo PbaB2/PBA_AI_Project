@@ -113,14 +113,27 @@ _DISLIKED_TASTE_KEYWORDS: list[tuple[str, str]] = [
 
 _BASE_KEYWORDS: list[str] = ["위스키", "럼", "보드카", "진", "데킬라", "사케", "소주", "맥주", "와인"]
 
+#대화 중단 의사 감지
+STOP_KEYWORDS = [
+    "그만", "됐어", "충분해", "이제 추천해줘", "추천해",
+    "그냥 해줘", "바로 해줘", "넘어가자", "skip", "그정도면 돼",
+]
 
-def _is_slot_empty(val: Any) -> bool:
-    return (
-        val is None
-        or (isinstance(val, list) and len(val) == 0)
-        or (isinstance(val, str) and val.strip() == "")
-    )
+def wants_to_skip(user_msg: str) -> bool:
+    """사용자가 대화 중단 의사를 표현했는지 확인"""
+    text = user_msg.lower()
+    return any(kw in text for kw in STOP_KEYWORDS)
 
+def _is_slot_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, list) and len(value) == 0:
+        return True
+    if isinstance(value, dict) and len(value) == 0:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
 
 def _calc_effective_completion(merged_slots: dict) -> float:
     fields = [
@@ -138,6 +151,27 @@ def _calc_effective_completion(merged_slots: dict) -> float:
     filled = sum(1 for v in fields if not _is_slot_empty(v))
     return round((filled / 10) * 100, 2)
 
+def choose_next_question(slots: dict) -> str:
+    for slot_key, q in _SLOT_QUESTIONS:
+        if _is_slot_empty(slots.get(slot_key)):
+            return q
+    return "네, 알겠습니다! 더 말씀해 주실 내용이 있나요?"
+
+def should_move_to_recommendation(
+    merged_slots: dict,
+    user_turn_count: int,
+    user_msg: str,
+) -> tuple[bool, str]:
+    completion = _calc_effective_completion(merged_slots)
+
+    if completion >= 80:
+        return True, "slot_completion"
+    if user_turn_count >= 7:
+        return True, "turn_limit"
+    if wants_to_skip(user_msg):
+        return True, "user_skip"
+
+    return False, "continue"
 
 def run_dialogue(
     history: list[dict],
@@ -227,6 +261,13 @@ def run_dialogue(
         extracted["finish_preference"] = "깔끔하게"
     elif "여운" in text or "진하게" in text:
         extracted["finish_preference"] = "여운 있게"
+
+    # ── 좋아하는 음료 추출 ───────────────────────────────────────
+    favorite_drink_keywords = ["모히토", "하이볼", "마가리타", "진토닉", "위스키 사워"]
+    for drink in favorite_drink_keywords:
+        if drink in text:
+            extracted["favorite_drinks"] = drink
+            break
 
     # ── 완성도 재계산 ────────────────────────────────────────────
     merged = dict(slots)
