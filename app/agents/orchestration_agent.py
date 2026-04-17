@@ -12,18 +12,25 @@ from app.db.crud import (
     get_latest_space_analysis_by_party,
     create_sample_recommendation,
     get_all_recipes_with_ingredients,
+    get_sample_recommendation,
+    create_sample_feedback,
+    create_final_recommendation,
+    update_preference_vector,
+    list_feedbacks_by_sample_recommendation,
 )
+from app.agents.preference_agent import classify_intent, update_vector
+from app.agents.output_agent import generate_recipe_snapshot
 
 # ============================================================
 # 매핑 테이블
 # ============================================================
 
 TASTE_TO_COCKTAIL = {
-    "단맛":   "sweet_level",
+    "단맛": "sweet_level",
     "달콤함": "sweet_level",
-    "쓴맛":   "bitter_level",
+    "쓴맛": "bitter_level",
     "쌉쌀함": "bitter_level",
-    "신맛":   "sour_level",
+    "신맛": "sour_level",
     "상큼함": "sour_level",
     "청량함": "freshness_level",
     "바디감": "body_level",
@@ -33,13 +40,13 @@ TASTE_TO_COCKTAIL = {
 }
 
 AROMA_TO_INGREDIENT = {
-    "민트향":    "minty_score",
-    "과일향":    "fruity_score",
+    "민트향": "minty_score",
+    "과일향": "fruity_score",
     "시트러스향": "citrus_score",
-    "허브향":    "herbal_score",
-    "커피향":    "coffee_score",
-    "우디향":    "woody_score",
-    "꽃향":     "floral_score",
+    "허브향": "herbal_score",
+    "커피향": "coffee_score",
+    "우디향": "woody_score",
+    "꽃향": "floral_score",
 }
 
 STRENGTH_RANGE = {
@@ -48,7 +55,10 @@ STRENGTH_RANGE = {
     "강함": (3.0, 5.0),
 }
 
-# ======helper함수 추가=======
+# ============================================================
+# helper
+# ============================================================
+
 def _merge_unique_list(*values) -> list[str]:
     merged: list[str] = []
     for v in values:
@@ -69,12 +79,10 @@ def _normalize_strength_tag(value: Optional[str]) -> Optional[str]:
         "약한": "약함",
         "술 못 마셔요": "약함",
         "가볍게": "약함",
-
         "중간": "중간",
         "적당히": "중간",
         "보통": "중간",
         "무난하게": "중간",
-
         "강함": "강함",
         "센 거": "강함",
         "센걸 원해요": "강함",
@@ -110,16 +118,85 @@ def _calc_effective_completion(merged_slots: dict) -> float:
     return round((filled / 10) * 100, 2)
 
 
+def _normalize(user: float, cocktail: float, max_range: float = 4.0) -> float:
+    return 1.0 - abs(user - cocktail) / max_range
+
+
+def _ingredient_name(ingredient: Ingredient) -> str:
+    return getattr(ingredient, "ingredients_name", None) or getattr(ingredient, "name_kr", "")
+
+
+def _vector_row_to_dict(vector_row) -> dict[str, float]:
+    return {
+        "sweetness_score": float(vector_row.sweetness_score),
+        "bitterness_score": float(vector_row.bitterness_score),
+        "sourness_score": float(vector_row.sourness_score),
+        "freshness_score": float(vector_row.freshness_score),
+        "body_score": float(vector_row.body_score),
+        "herbal_score": float(vector_row.herbal_score),
+        "citrus_score": float(vector_row.citrus_score),
+        "alcohol_score": float(vector_row.alcohol_score),
+    }
+
+
+def _build_reason_parts(
+    cocktail: Cocktail,
+    profile: dict,
+    recipe_ingredients: list[tuple],
+) -> list[str]:
+    merged = profile["merged_slots"]
+    space = profile["space"]
+    reasons: list[str] = []
+
+    matched_tastes: list[str] = []
+    for tag in (merged.get("preferred_tastes") or []):
+        col = TASTE_TO_COCKTAIL.get(tag)
+        if col and getattr(cocktail, col) is not None:
+            if float(getattr(cocktail, col)) >= 3.5:
+                matched_tastes.append(tag)
+
+    if matched_tastes:
+        reasons.append(f"선호 맛과 일치: {', '.join(matched_tastes)}")
+
+    matched_aromas: list[str] = []
+    for _, ingredient in recipe_ingredients:
+        for tag in (merged.get("preferred_aromas") or []):
+            col = AROMA_TO_INGREDIENT.get(tag)
+            if col and getattr(ingredient, col, 0) >= 3.0 and tag not in matched_aromas:
+                matched_aromas.append(tag)
+
+    if matched_aromas:
+        reasons.append(f"선호 향과 일치: {', '.join(matched_aromas)}")
+
+    if space and cocktail.mood_tag:
+        mood_prob = (space.mood_tags_json or {}).get(cocktail.mood_tag, 0.0)
+        if mood_prob >= 0.5:
+            reasons.append(f"공간 무드와 어울림: {cocktail.mood_tag}")
+
+    strength_pref = merged.get("strength_preference")
+    if strength_pref:
+        reasons.append(f"도수 선호 반영: {strength_pref}")
+
+    finish_pref = merged.get("finish_preference")
+    if finish_pref:
+        reasons.append(f"끝맛 선호 반영: {finish_pref}")
+
+    if not reasons:
+        reasons.append("기본 취향 점수 기반 추천")
+
+    return reasons
+
+
 # ============================================================
 # 1. 사용자 프로필 빌드
 # ============================================================
 
 def build_user_profile(db: Session, guest_session_id: str) -> dict:
-    guest   = get_guest_session(db, guest_session_id)
-    tags    = get_initial_tag_response(db, guest_session_id)
-    slot    = get_preference_slot(db, guest_session_id)
-    vector  = get_preference_vector(db, guest_session_id)
-    space   = get_latest_space_analysis_by_party(db, guest.party_session_id) if guest else None
+    guest = get_guest_session(db, guest_session_id)
+    tags = get_initial_tag_response(db, guest_session_id)
+    slot = get_preference_slot(db, guest_session_id)
+    vector = get_preference_vector(db, guest_session_id)
+    space = get_latest_space_analysis_by_party(db, guest.party_session_id) if guest else None
 
     merged_slots = {
         "party_purpose": slot.party_purpose if slot else None,
@@ -167,15 +244,18 @@ def build_user_profile(db: Session, guest_session_id: str) -> dict:
 # 2. 후보 칵테일 조회
 # ============================================================
 
-def get_candidate_cocktails(db: Session, exclude_ids: list[int] = []) -> list[Cocktail]:
-    query = db.query(Cocktail).filter(Cocktail.is_active == True)
+def get_candidate_cocktails(
+    db: Session,
+    exclude_ids: Optional[list[int]] = None,
+) -> list[Cocktail]:
+    query = db.query(Cocktail).filter(Cocktail.is_active.is_(True))
     if exclude_ids:
         query = query.filter(Cocktail.cocktail_id.notin_(exclude_ids))
     return query.all()
 
 
 # ============================================================
-# 3. 비선호 베이스 
+# 3. 비선호 베이스
 # ============================================================
 
 def _has_disliked_base(merged_slots: dict, recipe_ingredients: list[tuple]) -> bool:
@@ -184,7 +264,7 @@ def _has_disliked_base(merged_slots: dict, recipe_ingredients: list[tuple]) -> b
         return False
 
     for _, ingredient in recipe_ingredients:
-        if ingredient.ingredient_type == "BASE" and ingredient.ingredients_name in disliked_bases:
+        if ingredient.ingredient_type == "BASE" and _ingredient_name(ingredient) in disliked_bases:
             return True
     return False
 
@@ -193,11 +273,6 @@ def _has_disliked_base(merged_slots: dict, recipe_ingredients: list[tuple]) -> b
 # 4. 칵테일 점수 계산
 # ============================================================
 
-def _normalize(user: float, cocktail: float, max_range: float = 4.0) -> float:
-    """두 점수 차이를 0~1 유사도로 변환"""
-    return 1.0 - abs(user - cocktail) / max_range
-
-
 def score_cocktail(
     cocktail: Cocktail,
     profile: dict,
@@ -205,16 +280,16 @@ def score_cocktail(
 ) -> float:
     merged = profile["merged_slots"]
     vector = profile["vector"]
-    space  = profile["space"]
-    score  = 0.0
+    space = profile["space"]
+    score = 0.0
 
     # 1. 벡터 유사도
     pairs = [
-        (vector.sweetness_score,  cocktail.sweet_level,     4.0, 20),
-        (vector.sourness_score,   cocktail.sour_level,      4.0, 15),
-        (vector.bitterness_score, cocktail.bitter_level,    4.0, 10),
-        (vector.freshness_score,  cocktail.freshness_level, 4.0, 10),
-        (vector.body_score,       cocktail.body_level,      4.0,  8),
+        (vector.sweetness_score, cocktail.sweet_level, 4.0, 20),
+        (vector.sourness_score, cocktail.sour_level, 4.0, 15),
+        (vector.bitterness_score, cocktail.bitter_level, 4.0, 10),
+        (vector.freshness_score, cocktail.freshness_level, 4.0, 10),
+        (vector.body_score, cocktail.body_level, 4.0, 8),
     ]
     for user_s, cocktail_s, max_r, weight in pairs:
         if cocktail_s is None:
@@ -275,11 +350,11 @@ def recommend_top_k(
     db: Session,
     guest_session_id: str,
     k: int = 3,
-    exclude_ids: list[int] = [],
+    exclude_ids: Optional[list[int]] = None,
 ) -> list[dict]:
-    profile      = build_user_profile(db, guest_session_id)
+    profile = build_user_profile(db, guest_session_id)
     merged_slots = profile["merged_slots"]
-    candidates   = get_candidate_cocktails(db, exclude_ids=exclude_ids)
+    candidates = get_candidate_cocktails(db, exclude_ids=exclude_ids)
 
     all_ri = get_all_recipes_with_ingredients(db)
 
@@ -290,12 +365,17 @@ def recommend_top_k(
         if _has_disliked_base(merged_slots, ri):
             continue
 
-        s = score_cocktail(cocktail, profile, ri)
-        results.append({
-            "cocktail_id": cocktail.cocktail_id,
-            "name_kr": cocktail.name_kr,
-            "score": s,
-        })
+        score = score_cocktail(cocktail, profile, ri)
+        reason_parts = _build_reason_parts(cocktail, profile, ri)
+
+        results.append(
+            {
+                "cocktail_id": cocktail.cocktail_id,
+                "name_kr": cocktail.name_kr,
+                "score": score,
+                "reason_parts": reason_parts,
+            }
+        )
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:k]
@@ -309,15 +389,15 @@ def run_recommendation(
     db: Session,
     guest_session_id: str,
     k: int = 3,
-    exclude_ids: list[int] = [],
+    exclude_ids: Optional[list[int]] = None,
 ) -> dict:
     profile = build_user_profile(db, guest_session_id)
-    space   = profile["space"]
+    space = profile["space"]
 
     if not space:
         return {
             "status": "need_space_image",
-            "message": "공간 분석 결과가 없습니다. 이미지를 먼저 업로드해주세요."
+            "message": "공간 분석 결과가 없습니다. 이미지를 먼저 업로드해주세요.",
         }
 
     effective_completion = profile["effective_completion"]
@@ -325,7 +405,7 @@ def run_recommendation(
         return {
             "status": "need_more_info",
             "completion": effective_completion,
-            "message": "아직 추천에 필요한 정보가 부족합니다."
+            "message": "아직 추천에 필요한 정보가 부족합니다.",
         }
 
     top_k = recommend_top_k(db, guest_session_id, k=k, exclude_ids=exclude_ids)
@@ -338,13 +418,14 @@ def run_recommendation(
         }
 
     best = top_k[0]
+    reason_text = " / ".join(best["reason_parts"])
 
     row = create_sample_recommendation(
         db=db,
         guest_session_id=guest_session_id,
         space_analysis_id=space.space_analysis_id,
         recommended_cocktail_id=best["cocktail_id"],
-        recommendation_reason=f"취향 점수 기반 추천 (score: {best['score']})",
+        recommendation_reason=reason_text,
         rag_retrieved_ids_json=[r["cocktail_id"] for r in top_k],
         recipe_snapshot_json={"top_k": top_k},
     )
@@ -354,4 +435,151 @@ def run_recommendation(
         "completion": effective_completion,
         "top_k": top_k,
         "sample_recommendation_id": str(row.sample_recommendation_id),
+    }
+
+
+# ============================================================
+# 7. 피드백 처리
+# ============================================================
+
+def process_feedback(
+    db: Session,
+    guest_session_id: str,
+    sample_recommendation_id: str,
+    feedback_text: str,
+) -> dict:
+    sample_row = get_sample_recommendation(db, sample_recommendation_id)
+    if not sample_row:
+        raise ValueError("sample recommendation not found")
+
+    if str(sample_row.guest_session_id) != str(guest_session_id):
+        raise ValueError("sample recommendation does not belong to this guest")
+
+    profile = build_user_profile(db, guest_session_id)
+    vector_row = profile["vector"]
+    if not vector_row:
+        raise ValueError("preference vector not found")
+
+    intent = classify_intent(feedback_text)
+
+    before_vec = _vector_row_to_dict(vector_row)
+    updated_vec = dict(before_vec)
+
+    if intent == "ADJUST":
+        updated_vec = update_vector(before_vec, feedback_text)
+
+        update_preference_vector(
+            db=db,
+            guest_session_id=guest_session_id,
+            updates=updated_vec,
+            increment_version=True,
+        )
+
+    feedback_row = create_sample_feedback(
+        db=db,
+        sample_recommendation_id=sample_recommendation_id,
+        feedback_text=feedback_text,
+        feedback_intent=intent,
+        sweetness_delta=(
+            updated_vec["sweetness_score"] - before_vec["sweetness_score"]
+            if intent == "ADJUST" else None
+        ),
+        sourness_delta=(
+            updated_vec["sourness_score"] - before_vec["sourness_score"]
+            if intent == "ADJUST" else None
+        ),
+        bitterness_delta=(
+            updated_vec["bitterness_score"] - before_vec["bitterness_score"]
+            if intent == "ADJUST" else None
+        ),
+        body_delta=(
+            updated_vec["body_score"] - before_vec["body_score"]
+            if intent == "ADJUST" else None
+        ),
+        freshness_delta=(
+            updated_vec["freshness_score"] - before_vec["freshness_score"]
+            if intent == "ADJUST" else None
+        ),
+        aroma_delta_json=None,
+        parsed_summary=feedback_text,
+    )
+
+    # ACCEPT → 최종 추천 확정
+    if intent == "ACCEPT":
+        all_feedbacks = list_feedbacks_by_sample_recommendation(db, sample_recommendation_id)
+        feedback_ids = [str(row.sample_feedback_id) for row in all_feedbacks]
+
+        final_snapshot = generate_recipe_snapshot(
+            db=db,
+            cocktail_id=sample_row.recommended_cocktail_id,
+            volume_ml=90,
+        )
+
+        final_row = create_final_recommendation(
+            db=db,
+            guest_session_id=guest_session_id,
+            sample_recommendation_id=sample_recommendation_id,
+            final_cocktail_id=sample_row.recommended_cocktail_id,
+            used_feedback_ids_json=feedback_ids,
+            is_adjusted_recipe=False,
+            final_recipe_snapshot_json=final_snapshot,
+            final_reason_text="사용자가 시음 후 현재 추천을 최종 선택했습니다.",
+        )
+
+        return {
+            "status": "accepted",
+            "intent": "ACCEPT",
+            "final_recommendation_id": str(final_row.final_recommendation_id),
+            "final_cocktail_id": sample_row.recommended_cocktail_id,
+        }
+
+    # ADJUST → 벡터 업데이트 후 재추천
+    if intent == "ADJUST":
+        rerun = run_recommendation(
+            db=db,
+            guest_session_id=guest_session_id,
+            k=3,
+            exclude_ids=[sample_row.recommended_cocktail_id],
+        )
+
+        if rerun.get("status") != "ok":
+            return {
+                "status": "adjust_processed",
+                "intent": "ADJUST",
+                "updated_vector": updated_vec,
+                "sample_feedback_id": str(feedback_row.sample_feedback_id),
+                "next": rerun,
+            }
+
+        return {
+            "status": "re_recommended",
+            "intent": "ADJUST",
+            "updated_vector": updated_vec,
+            "top_k": rerun["top_k"],
+            "sample_recommendation_id": rerun["sample_recommendation_id"],
+            "sample_feedback_id": str(feedback_row.sample_feedback_id),
+        }
+
+    # REJECT → 현재 추천 제외 후 새 후보 추천
+    rerun = run_recommendation(
+        db=db,
+        guest_session_id=guest_session_id,
+        k=3,
+        exclude_ids=[sample_row.recommended_cocktail_id],
+    )
+
+    if rerun.get("status") != "ok":
+        return {
+            "status": "reject_processed",
+            "intent": "REJECT",
+            "sample_feedback_id": str(feedback_row.sample_feedback_id),
+            "next": rerun,
+        }
+
+    return {
+        "status": "re_recommended",
+        "intent": "REJECT",
+        "top_k": rerun["top_k"],
+        "sample_recommendation_id": rerun["sample_recommendation_id"],
+        "sample_feedback_id": str(feedback_row.sample_feedback_id),
     }

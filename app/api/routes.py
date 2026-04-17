@@ -17,14 +17,13 @@ from app.db.crud import (
     list_dialogue_turns,
     get_preference_slot,
     update_preference_slots,
-    get_preference_vector,
-    create_sample_feedback,
-    update_preference_vector,
-    get_latest_sample_recommendation_by_guest,
+    get_final_recommendation_by_id,
+    get_initial_tag_response,
 )
 from app.utils.config import UPLOAD_DIR
-from app.agents.preference_agent import run_dialogue, classify_intent, update_vector
-from app.agents.orchestration_agent import run_recommendation
+from app.agents.preference_agent import run_dialogue
+from app.agents.orchestration_agent import run_recommendation, process_feedback
+from app.agents.output_agent import generate_output_json
 
 router = APIRouter()
 
@@ -55,7 +54,7 @@ class DialogueRequest(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    sample_recommendation_id: str | None = None
+    sample_recommendation_id: str
     feedback_text: str
 
 
@@ -134,22 +133,7 @@ def recommend_sample_endpoint(
     if not guest:
         raise HTTPException(status_code=404, detail="guest_session_id not found")
 
-    result = run_recommendation(db, gid, k=3)
-
-    # 1) 공간 이미지 없음
-    if result.get("status") == "need_space_image":
-        return result
-
-    # 2) 정보 부족
-    if result.get("status") == "need_more_info":
-        return result
-
-    # 3) 후보 없음
-    if result.get("status") == "no_candidates":
-        return result
-
-    # 4) 정상 추천
-    return result
+    return run_recommendation(db, gid, k=3)
 
 
 @router.post("/sessions/{gid}/feedback")
@@ -162,75 +146,15 @@ def feedback_endpoint(
     if not guest:
         raise HTTPException(status_code=404, detail="guest_session_id not found")
 
-    current_vector = get_preference_vector(db, gid)
-    if not current_vector:
-        raise HTTPException(status_code=404, detail="preference_vector not found")
-
-    # sample_recommendation_id가 안 오면 가장 최근 추천 사용
-    sample_recommendation = None
-    if req.sample_recommendation_id:
-        # 지금은 latest 기반으로 충분해서 별도 get 없이도 되지만,
-        # 안전하게 latest만 써도 됨
-        latest = get_latest_sample_recommendation_by_guest(db, gid)
-        if not latest or str(latest.sample_recommendation_id) != req.sample_recommendation_id:
-            sample_recommendation = latest
-        else:
-            sample_recommendation = latest
-    else:
-        sample_recommendation = get_latest_sample_recommendation_by_guest(db, gid)
-
-    if not sample_recommendation:
-        raise HTTPException(status_code=404, detail="sample_recommendation not found")
-
-    intent = classify_intent(req.feedback_text)
-
-    vector_dict = {
-        "sweetness_score": float(current_vector.sweetness_score),
-        "bitterness_score": float(current_vector.bitterness_score),
-        "sourness_score": float(current_vector.sourness_score),
-        "freshness_score": float(current_vector.freshness_score),
-        "body_score": float(current_vector.body_score),
-        "herbal_score": float(current_vector.herbal_score),
-        "citrus_score": float(current_vector.citrus_score),
-        "alcohol_score": float(current_vector.alcohol_score),
-    }
-
-    updated_vector_dict = update_vector(vector_dict, req.feedback_text)
-
-    saved_feedback = create_sample_feedback(
-        db=db,
-        sample_recommendation_id=sample_recommendation.sample_recommendation_id,
-        feedback_text=req.feedback_text,
-        feedback_intent=intent,
-        parsed_summary=f"분류 결과: {intent}",
-    )
-
-    updated_vector = update_preference_vector(
-        db=db,
-        guest_session_id=gid,
-        updates=updated_vector_dict,
-        increment_version=True,
-    )
-
-    return {
-        "status": "ok",
-        "sample_feedback_id": str(saved_feedback.sample_feedback_id),
-        "sample_recommendation_id": str(sample_recommendation.sample_recommendation_id),
-        "feedback_intent": intent,
-        "feedback_text": saved_feedback.feedback_text,
-        "updated_vector": {
-            "sweetness_score": float(updated_vector.sweetness_score),
-            "bitterness_score": float(updated_vector.bitterness_score),
-            "sourness_score": float(updated_vector.sourness_score),
-            "freshness_score": float(updated_vector.freshness_score),
-            "body_score": float(updated_vector.body_score),
-            "herbal_score": float(updated_vector.herbal_score),
-            "citrus_score": float(updated_vector.citrus_score),
-            "alcohol_score": float(updated_vector.alcohol_score),
-            "version": updated_vector.version,
-        },
-        "created_at": saved_feedback.created_at.isoformat() if saved_feedback.created_at else None,
-    }
+    try:
+        return process_feedback(
+            db=db,
+            guest_session_id=gid,
+            sample_recommendation_id=req.sample_recommendation_id,
+            feedback_text=req.feedback_text,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 # ============================================================
 # 1. Party / Guest Session
@@ -373,6 +297,18 @@ def dialogue_endpoint(
     if not guest:
         raise HTTPException(status_code=404, detail="guest_session_id not found")
 
+    # 0) 대화 히스토리 조회 (턴 수 체크용)
+    history_rows = list_dialogue_turns(db, gid)
+    user_turn_count = sum(1 for r in history_rows if r.speaker_role == "USER")
+    if user_turn_count >= 7:
+        slot_row = get_preference_slot(db, gid)
+        return {
+            "status": "max_turns_reached",
+            "message": "대화 한도(7회)에 도달했습니다. 추천을 진행해주세요.",
+            "should_proceed": True,
+            "completion": float(slot_row.slot_completion_score) if slot_row else 0.0,
+        }
+
     # 1) 사용자 턴 저장
     user_turn = create_dialogue_turn(
         db=db,
@@ -386,8 +322,17 @@ def dialogue_endpoint(
     slot_row = get_preference_slot(db, gid)
     current_slots = _slot_row_to_internal_dict(slot_row)
 
-    # 3) 전체 대화 히스토리 조회
-    history_rows = list_dialogue_turns(db, gid)
+    # 2-1) 초기 태그를 슬롯에 병합 (대화 완성도에 반영)
+    tag_row = get_initial_tag_response(db, gid)
+    if tag_row:
+        if not current_slots.get("preferred_tastes"):
+            current_slots["preferred_tastes"] = tag_row.taste_tags_json or []
+        if not current_slots.get("preferred_aromas"):
+            current_slots["preferred_aromas"] = tag_row.aroma_tags_json or []
+        if not current_slots.get("strength_preference") and tag_row.strength_tag:
+            current_slots["strength_preference"] = tag_row.strength_tag
+
+    # 3) 전체 대화 히스토리 구성
     history = [
         {
             "speaker_role": row.speaker_role,
@@ -436,3 +381,18 @@ def dialogue_endpoint(
         "completion": completion,
         "should_proceed": should_proceed,
     }
+
+@router.get("/final-output/{final_recommendation_id}")
+def final_output_endpoint(
+    final_recommendation_id: str,
+    db: Session = Depends(get_db),
+):
+    final_row = get_final_recommendation_by_id(db, final_recommendation_id)
+    if not final_row:
+        raise HTTPException(status_code=404, detail="final_recommendation_id not found")
+
+    return generate_output_json(
+        db=db,
+        cocktail_id=final_row.final_cocktail_id,
+        volume_ml=90,
+    )

@@ -1,304 +1,322 @@
+"""
+preference_agent.py
+역할: 슬롯 추출, 대화 로직, 피드백 인텐트 분류, 벡터 업데이트 해석, 사용자 프로필 빌드
+"""
 from __future__ import annotations
 
-from typing import Any
-import re
+from typing import Any, Optional
+from sqlalchemy.orm import Session
 
-REQUIRED_SLOTS = [
-    "party_purpose",
-    "current_mood",
-    "preferred_tastes",
-    "disliked_tastes",
-    "preferred_aromas",
-    "disliked_aromas",
-    "strength_preference",
-    "favorite_drinks",
-    "disliked_bases",
-    "finish_preference",
+from app.db.crud import (
+    get_guest_session,
+    get_initial_tag_response,
+    get_preference_slot,
+    get_preference_vector,
+    get_latest_space_analysis_by_party,
+)
+
+
+# ============================================================
+# 피드백 인텐트 분류 (rule-based MVP)
+# ============================================================
+
+def classify_intent(feedback_text: str) -> str:
+    """피드백 텍스트를 ACCEPT / ADJUST / REJECT 중 하나로 분류."""
+    text = feedback_text.lower()
+
+    accept_keywords = [
+        "좋아", "완벽", "이걸로", "맛있어", "마음에 들어",
+        "ok", "오케이", "선택", "확정", "맞아", "딱이야",
+    ]
+    adjust_keywords = [
+        "더", "조금", "살짝", "약간", "달게", "쓰게", "시게",
+        "강하게", "약하게", "바꿔", "수정", "변경", "달았으면", "썼으면",
+    ]
+
+    for kw in accept_keywords:
+        if kw in text:
+            return "ACCEPT"
+    for kw in adjust_keywords:
+        if kw in text:
+            return "ADJUST"
+    return "REJECT"
+
+
+# ============================================================
+# 선호 벡터 조정 (rule-based MVP)
+# ============================================================
+
+def update_vector(before_vec: dict[str, float], feedback_text: str) -> dict[str, float]:
+    """피드백 키워드에 따라 선호 벡터를 소폭 조정."""
+    updated = dict(before_vec)
+    text = feedback_text.lower()
+
+    def clamp(v: float) -> float:
+        return max(0.0, min(5.0, v))
+
+    adjustments: list[tuple[list[str], str, float]] = [
+        (["더 달", "달게", "달았으면"],          "sweetness_score",  +0.5),
+        (["덜 달", "덜달", "달지 않게"],          "sweetness_score",  -0.5),
+        (["더 쓰", "쓰게", "썼으면"],             "bitterness_score", +0.5),
+        (["덜 쓰", "덜쓰"],                       "bitterness_score", -0.5),
+        (["더 시", "시게"],                       "sourness_score",   +0.5),
+        (["덜 시", "덜시"],                       "sourness_score",   -0.5),
+        (["더 강", "강하게"],                     "alcohol_score",    +0.5),
+        (["약하게", "더 약", "가볍게"],            "alcohol_score",    -0.5),
+        (["청량", "상큼"],                        "freshness_score",  +0.5),
+    ]
+
+    for keywords, field, delta in adjustments:
+        if any(kw in text for kw in keywords):
+            updated[field] = clamp(updated.get(field, 2.5) + delta)
+
+    return updated
+
+
+# ============================================================
+# 대화 에이전트 — 슬롯 추출 + 다음 질문 생성 (rule-based MVP)
+# ============================================================
+
+_SLOT_QUESTIONS: list[tuple[str, str]] = [
+    ("party_purpose",       "오늘 어떤 자리인가요? (생일, 데이트, 모임 등)"),
+    ("strength_preference", "알코올은 어느 정도 선호하세요? (약하게, 중간, 강하게)"),
+    ("current_mood",        "지금 기분이 어떠세요?"),
+    ("preferred_tastes",    "어떤 맛을 좋아하세요? (단맛, 쓴맛, 신맛 등)"),
+    ("preferred_aromas",    "어떤 향을 좋아하세요? (과일향, 민트향, 커피향 등)"),
+    ("disliked_tastes",     "싫어하는 맛이 있나요?"),
+    ("disliked_bases",      "못 마시는 술 베이스가 있나요? (위스키, 럼, 보드카 등)"),
+    ("finish_preference",   "끝맛은 어떤 게 좋으세요? (깔끔하게, 여운 있게)"),
+    ("favorite_drinks",     "평소에 즐겨 마시는 술이 있나요?"),
+    ("disliked_aromas",     "싫어하는 향이 있나요?"),
 ]
 
-NEGATIVE_CUES = ["싫", "안 좋아", "별로", "부담", "빼고", "제외", "피하고"]
-POSITIVE_CUES = ["좋아", "좋고", "좋겠", "원해", "선호", "괜찮"]
+_TASTE_KEYWORDS: list[tuple[str, str]] = [
+    ("달", "단맛"), ("단맛", "단맛"),
+    ("쓴", "쓴맛"), ("쓴맛", "쓴맛"),
+    ("신", "신맛"), ("상큼", "신맛"),
+    ("청량", "청량함"),
+    ("바디", "바디감"),
+    ("크리미", "크리미함"),
+    ("스파이시", "스파이시"),
+    ("고소", "고소함"),
+]
 
-AROMA_KEYWORDS = {
-    "민트향": "민트향",
-    "민트": "민트향",
-    "과일향": "과일향",
-    "과일": "과일향",
-    "우디향": "우디향",
-    "우디": "우디향",
-    "커피향": "커피향",
-    "커피": "커피향",
-    "시트러스향": "시트러스향",
-    "시트러스": "시트러스향",
-    "허브향": "허브향",
-    "허브": "허브향",
-}
+_AROMA_KEYWORDS: list[tuple[str, str]] = [
+    ("민트", "민트향"), ("과일", "과일향"), ("시트러스", "시트러스향"),
+    ("허브", "허브향"), ("커피", "커피향"), ("우디", "우디향"), ("꽃", "꽃향"),
+]
 
-TASTE_KEYWORDS = {
-    "상큼": "상큼함",
-    "달콤": "단맛",
-    "단맛": "단맛",
-    "청량": "청량함",
-    "고소": "고소함",
-    "스파이시": "스파이시",
-    "매콤": "스파이시",
-    "밀키": "밀키함",
-    "부드러운": "밀키함",
-    "쓴맛": "쓴맛",
-    "쌉쌀": "쓴맛",
-    "신맛": "신맛",
-}
+_DISLIKED_TASTE_KEYWORDS: list[tuple[str, str]] = [
+    ("쓴 거 싫", "쓴맛"), ("단 거 싫", "단맛"), ("신 거 싫", "신맛"),
+    ("쓴맛 싫", "쓴맛"), ("단맛 싫", "단맛"), ("신맛 싫", "신맛"),
+]
 
-BASE_KEYWORDS = {
-    "위스키": "위스키",
-    "럼": "럼",
-    "진": "진",
-    "데킬라": "데킬라",
-    "보드카": "보드카",
-}
+_BASE_KEYWORDS: list[str] = ["위스키", "럼", "보드카", "진", "데킬라", "사케", "소주", "맥주", "와인"]
 
 
-def split_clauses(text: str) -> list[str]:
-    parts = re.split(r"[.!?]|,| 그리고 | 근데 | 하지만 | 다만 | 그런데 ", text)
-    return [p.strip() for p in parts if p.strip()]
+def _is_slot_empty(val: Any) -> bool:
+    return (
+        val is None
+        or (isinstance(val, list) and len(val) == 0)
+        or (isinstance(val, str) and val.strip() == "")
+    )
 
 
-def is_negative_clause(clause: str) -> bool:
-    return any(cue in clause for cue in NEGATIVE_CUES)
+def _calc_effective_completion(merged_slots: dict) -> float:
+    fields = [
+        merged_slots.get("party_purpose"),
+        merged_slots.get("current_mood"),
+        merged_slots.get("preferred_tastes"),
+        merged_slots.get("disliked_tastes"),
+        merged_slots.get("preferred_aromas"),
+        merged_slots.get("disliked_aromas"),
+        merged_slots.get("strength_preference"),
+        merged_slots.get("favorite_drinks"),
+        merged_slots.get("disliked_bases"),
+        merged_slots.get("finish_preference"),
+    ]
+    filled = sum(1 for v in fields if not _is_slot_empty(v))
+    return round((filled / 10) * 100, 2)
 
 
-def collect_tags(clause: str, keyword_map: dict[str, str]) -> list[str]:
-    found = []
-    for keyword, tag in keyword_map.items():
-        if keyword in clause and tag not in found:
-            found.append(tag)
-    return found
+def run_dialogue(
+    history: list[dict],
+    slots: dict,
+    user_msg: str,
+) -> dict:
+    """
+    대화 한 턴 처리.
+    slots: 현재까지 채워진 슬롯 (초기 태그 포함 병합 상태)
+    Returns: { extracted_slots, question, completion, should_proceed }
+    """
+    extracted: dict[str, Any] = {}
+    text = user_msg.lower()
 
-def _is_filled(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str) and value.strip() == "":
-        return False
-    if isinstance(value, list) and len(value) == 0:
-        return False
-    if isinstance(value, dict) and len(value) == 0:
-        return False
-    return True
+    # ── 파티 목적 추출 ──────────────────────────────────────────
+    purpose_map = [
+        ("생일", "생일 파티"), ("기념일", "기념일"), ("데이트", "데이트"),
+        ("회식", "회식"), ("모임", "친목 모임"), ("파티", "파티"),
+    ]
+    for kw, val in purpose_map:
+        if kw in text:
+            extracted["party_purpose"] = val
+            break
+
+    # ── 도수 선호 추출 ──────────────────────────────────────────
+    strength_map = [
+        ("못 마셔", "약함"), ("약하게", "약함"), ("약한", "약함"), ("가볍게", "약함"),
+        ("강하게", "강함"), ("강한", "강함"), ("잘 마셔", "강함"),
+        ("중간", "중간"), ("보통", "중간"), ("적당히", "중간"),
+    ]
+    for kw, val in strength_map:
+        if kw in text:
+            extracted["strength_preference"] = val
+            break
+
+    # ── 선호 맛 추출 ────────────────────────────────────────────
+    prev_tastes: list[str] = list(slots.get("preferred_tastes") or [])
+    new_tastes = list(prev_tastes)
+    for kw, tag in _TASTE_KEYWORDS:
+        if kw in text and tag not in new_tastes:
+            new_tastes.append(tag)
+    if new_tastes != prev_tastes:
+        extracted["preferred_tastes"] = new_tastes
+
+    # ── 선호 향 추출 ────────────────────────────────────────────
+    prev_aromas: list[str] = list(slots.get("preferred_aromas") or [])
+    new_aromas = list(prev_aromas)
+    for kw, tag in _AROMA_KEYWORDS:
+        if kw in text and tag not in new_aromas:
+            new_aromas.append(tag)
+    if new_aromas != prev_aromas:
+        extracted["preferred_aromas"] = new_aromas
+
+    # ── 비선호 맛 추출 ──────────────────────────────────────────
+    prev_disliked: list[str] = list(slots.get("disliked_tastes") or [])
+    new_disliked = list(prev_disliked)
+    for kw, tag in _DISLIKED_TASTE_KEYWORDS:
+        if kw in text and tag not in new_disliked:
+            new_disliked.append(tag)
+    if new_disliked != prev_disliked:
+        extracted["disliked_tastes"] = new_disliked
+
+    # ── 비선호 베이스 추출 ──────────────────────────────────────
+    neg_markers = ["싫어", "못 마셔", "안 마셔", "안마셔", "싫"]
+    is_negative_context = any(m in text for m in neg_markers)
+    if is_negative_context:
+        prev_bases: list[str] = list(slots.get("disliked_bases") or [])
+        new_bases = list(prev_bases)
+        for base in _BASE_KEYWORDS:
+            if base in text and base not in new_bases:
+                new_bases.append(base)
+        if new_bases != prev_bases:
+            extracted["disliked_bases"] = new_bases
+
+    # ── 기분 추출 ────────────────────────────────────────────────
+    mood_map = [
+        ("신나", "신남"), ("설레", "설렘"), ("피곤", "피곤함"),
+        ("편안", "편안함"), ("슬프", "슬픔"), ("기뻐", "기쁨"), ("즐거", "즐거움"),
+    ]
+    for kw, val in mood_map:
+        if kw in text:
+            extracted["current_mood"] = val
+            break
+
+    # ── 끝맛 선호 ────────────────────────────────────────────────
+    if "깔끔" in text:
+        extracted["finish_preference"] = "깔끔하게"
+    elif "여운" in text or "진하게" in text:
+        extracted["finish_preference"] = "여운 있게"
+
+    # ── 완성도 재계산 ────────────────────────────────────────────
+    merged = dict(slots)
+    merged.update(extracted)
+    completion = _calc_effective_completion(merged)
+
+    # ── 다음 질문 결정 ───────────────────────────────────────────
+    question = "네, 알겠습니다! 더 말씀해 주실 내용이 있나요?"
+    for slot_key, q in _SLOT_QUESTIONS:
+        if _is_slot_empty(merged.get(slot_key)):
+            question = q
+            break
+
+    return {
+        "extracted_slots": extracted,
+        "question": question,
+        "completion": completion,
+        "should_proceed": completion >= 80,
+    }
 
 
-def get_completion(slots: dict) -> float:
-    filled = 0
-    for key in REQUIRED_SLOTS:
-        if _is_filled(slots.get(key)):
-            filled += 1
-    return round((filled / len(REQUIRED_SLOTS)) * 100, 1)
+# ============================================================
+# 사용자 프로필 빌드 (초기 태그 + 슬롯 병합)
+# ============================================================
 
-
-def _merge_list_slot(old_value: Any, new_items: list[str]) -> list[str]:
-    current = old_value if isinstance(old_value, list) else []
-    merged = list(current)
-
-    for item in new_items:
-        if item not in merged:
-            merged.append(item)
-
+def _merge_unique_list(*values) -> list[str]:
+    merged: list[str] = []
+    for v in values:
+        if not v:
+            continue
+        for item in v:
+            if item not in merged:
+                merged.append(item)
     return merged
 
 
-def extract_slots_from_korean_text(user_msg: str, current_slots: dict) -> dict:
-    text = user_msg.strip()
-    extracted = {}
-
-    # 1. 파티 목적
-    if "생일" in text:
-        extracted["party_purpose"] = "생일파티"
-    elif "축하" in text:
-        extracted["party_purpose"] = "축하자리"
-    elif "데이트" in text:
-        extracted["party_purpose"] = "데이트"
-    elif "혼자" in text:
-        extracted["party_purpose"] = "혼술"
-    elif "친구" in text and "파티" in text:
-        extracted["party_purpose"] = "친구모임"
-
-    # 2. 현재 기분
-    if "기분 좋아" in text or "신나" in text or "행복" in text:
-        extracted["current_mood"] = "신남"
-    elif "우울" in text or "처져" in text:
-        extracted["current_mood"] = "우울함"
-    elif "차분" in text or "조용" in text:
-        extracted["current_mood"] = "차분함"
-    elif "스트레스" in text:
-        extracted["current_mood"] = "스트레스"
-
-    # 3. 선호 맛
-    # 3~9. 맛 / 향 / 베이스는 절 단위로 긍정/부정 판별
-    preferred_tastes = []
-    disliked_tastes = []
-    preferred_aromas = []
-    disliked_aromas = []
-    disliked_bases = []
-
-    clauses = split_clauses(text)
-
-    for clause in clauses:
-        neg = is_negative_clause(clause)
-
-        taste_tags = collect_tags(clause, TASTE_KEYWORDS)
-        aroma_tags = collect_tags(clause, AROMA_KEYWORDS)
-        base_tags = collect_tags(clause, BASE_KEYWORDS)
-
-        if neg:
-            disliked_tastes = _merge_list_slot(disliked_tastes, taste_tags)
-            disliked_aromas = _merge_list_slot(disliked_aromas, aroma_tags)
-            disliked_bases = _merge_list_slot(disliked_bases, base_tags)
-        else:
-            preferred_tastes = _merge_list_slot(preferred_tastes, taste_tags)
-            preferred_aromas = _merge_list_slot(preferred_aromas, aroma_tags)
-
-    # 비선호가 우선
-    preferred_tastes = [x for x in preferred_tastes if x not in disliked_tastes]
-    preferred_aromas = [x for x in preferred_aromas if x not in disliked_aromas]
-
-    if preferred_tastes:
-        extracted["preferred_tastes"] = _merge_list_slot(
-            current_slots.get("preferred_tastes"),
-            preferred_tastes,
-        )
-
-    if disliked_tastes:
-        extracted["disliked_tastes"] = _merge_list_slot(
-            current_slots.get("disliked_tastes"),
-            disliked_tastes,
-        )
-
-    if preferred_aromas:
-        extracted["preferred_aromas"] = _merge_list_slot(
-            current_slots.get("preferred_aromas"),
-            preferred_aromas,
-        )
-
-    if disliked_aromas:
-        extracted["disliked_aromas"] = _merge_list_slot(
-            current_slots.get("disliked_aromas"),
-            disliked_aromas,
-        )
-
-    if disliked_bases:
-        extracted["disliked_bases"] = _merge_list_slot(
-            current_slots.get("disliked_bases"),
-            disliked_bases,
-        )
-
-    # 10. 끝맛 선호
-    if "깔끔한 끝맛" in text or "깔끔했으면" in text:
-        extracted["finish_preference"] = "깔끔함"
-    elif "달콤한 여운" in text:
-        extracted["finish_preference"] = "달콤함"
-    elif "가벼운 끝맛" in text:
-        extracted["finish_preference"] = "가벼움"
-        
-    if "preferred_aromas" in extracted and "disliked_aromas" in extracted:
-        extracted["preferred_aromas"] = [
-            x for x in extracted["preferred_aromas"]
-            if x not in extracted["disliked_aromas"]
-        ]
-
-    if "preferred_tastes" in extracted and "disliked_tastes" in extracted:
-        extracted["preferred_tastes"] = [
-            x for x in extracted["preferred_tastes"]
-            if x not in extracted["disliked_tastes"]
-        ]
-
-    return extracted
-
-
-def choose_next_question(slots: dict) -> str:
-    question_map = {
-        "party_purpose": "오늘은 어떤 자리에서 마시는 건가요? 예를 들면 생일파티, 친구 모임, 데이트 같은 식으로 알려주세요.",
-        "current_mood": "지금 기분은 어떠세요? 신나는지, 차분한지, 기분 전환이 필요한지도 괜찮아요.",
-        "preferred_tastes": "좋아하는 맛을 조금 더 알려주세요. 상큼한 맛, 달콤한 맛, 청량한 맛 중 어떤 쪽이 좋나요?",
-        "disliked_tastes": "반대로 피하고 싶은 맛도 있나요? 예를 들면 너무 단맛, 너무 쓴맛 같은 느낌이요.",
-        "preferred_aromas": "좋아하는 향이 있나요? 과일향, 민트향, 우디향처럼 편하게 말씀해주셔도 됩니다.",
-        "disliked_aromas": "싫어하거나 피하고 싶은 향도 있나요?",
-        "strength_preference": "도수는 어느 정도를 원하세요? 약한 편, 중간, 강한 편 중에서 골라도 괜찮아요.",
-        "favorite_drinks": "평소에 좋아하는 술이나 칵테일이 있다면 말씀해주세요.",
-        "disliked_bases": "싫어하는 베이스 술이 있나요? 예를 들면 위스키, 럼, 진 같은 종류요.",
-        "finish_preference": "끝맛은 어떤 느낌이 좋으세요? 깔끔한 쪽인지, 달콤하게 남는 쪽인지 알려주세요.",
+def _normalize_strength_tag(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    mapping = {
+        "약함": "약함", "약한": "약함", "술 못 마셔요": "약함", "가볍게": "약함",
+        "중간": "중간", "적당히": "중간", "보통": "중간", "무난하게": "중간",
+        "강함": "강함", "센 거": "강함", "센걸 원해요": "강함", "술 잘 마셔요": "강함",
     }
-
-    for slot in REQUIRED_SLOTS:
-        if not _is_filled(slots.get(slot)):
-            return question_map[slot]
-
-    return "정보가 충분히 모였습니다. 이제 추천 단계로 넘어갈게요."
+    return mapping.get(value, value)
 
 
-def run_dialogue(history: list, slots: dict, user_msg: str) -> dict:
-    extracted = extract_slots_from_korean_text(user_msg, slots)
+def build_user_profile(db: Session, guest_session_id: str) -> dict:
+    """초기 태그 + preference_slot + preference_vector + space_analysis 통합."""
+    guest = get_guest_session(db, guest_session_id)
+    tags  = get_initial_tag_response(db, guest_session_id)
+    slot  = get_preference_slot(db, guest_session_id)
+    vector = get_preference_vector(db, guest_session_id)
+    space  = get_latest_space_analysis_by_party(db, guest.party_session_id) if guest else None
 
-    updated_slots = dict(slots)
-    updated_slots.update(extracted)
-
-    completion = get_completion(updated_slots)
-    should_proceed = completion >= 80
-
-    question = (
-        "정보가 충분히 모였습니다. 이제 추천 단계로 진행할게요."
-        if should_proceed
-        else choose_next_question(updated_slots)
-    )
+    merged_slots = {
+        "party_purpose": slot.party_purpose if slot else None,
+        "current_mood":  slot.current_mood  if slot else None,
+        "preferred_tastes": _merge_unique_list(
+            tags.taste_tags_json  if tags else [],
+            slot.preferred_tastes_json if slot else [],
+        ),
+        "disliked_tastes": _merge_unique_list(
+            slot.disliked_tastes_json if slot else [],
+        ),
+        "preferred_aromas": _merge_unique_list(
+            tags.aroma_tags_json   if tags else [],
+            slot.preferred_aromas_json if slot else [],
+        ),
+        "disliked_aromas": _merge_unique_list(
+            slot.disliked_aromas_json if slot else [],
+        ),
+        "strength_preference": (
+            slot.strength_preference
+            if slot and slot.strength_preference
+            else _normalize_strength_tag(tags.strength_tag if tags else None)
+        ),
+        "favorite_drinks": slot.favorite_drinks_text if slot else None,
+        "disliked_bases":  _merge_unique_list(
+            slot.disliked_bases_json if slot else [],
+        ),
+        "finish_preference": slot.finish_preference if slot else None,
+    }
 
     return {
-        "question": question,
-        "extracted_slots": extracted,
-        "updated_slots": updated_slots,
-        "completion": completion,
-        "should_proceed": should_proceed,
+        "guest":              guest,
+        "initial_tags":       tags,
+        "slot":               slot,
+        "vector":             vector,
+        "space":              space,
+        "merged_slots":       merged_slots,
+        "effective_completion": _calc_effective_completion(merged_slots),
     }
-
-
-def classify_intent(feedback_text: str) -> str:
-    text = feedback_text.strip()
-
-    if "이걸로" in text or "좋아" in text or "괜찮아" in text:
-        return "ACCEPT"
-    if "다른" in text or "바꿔" in text or "새로운" in text:
-        return "REJECT"
-    return "ADJUST"
-
-
-def update_vector(current: dict, feedback_text: str) -> dict:
-    new_vec = dict(current)
-    text = feedback_text.strip()
-
-    def get_score(key: str, default: float = 3.0) -> float:
-        return float(new_vec.get(key, default))
-
-    if "너무 달" in text or "덜 달" in text:
-        new_vec["sweetness_score"] = max(1.0, get_score("sweetness_score") - 1.0)
-
-    if "더 달" in text:
-        new_vec["sweetness_score"] = min(5.0, get_score("sweetness_score") + 1.0)
-
-    if "더 상큼" in text:
-        new_vec["freshness_score"] = min(5.0, get_score("freshness_score") + 1.0)
-        new_vec["sourness_score"] = min(5.0, get_score("sourness_score") + 1.0)
-
-    if "덜 상큼" in text:
-        new_vec["freshness_score"] = max(1.0, get_score("freshness_score") - 1.0)
-        new_vec["sourness_score"] = max(1.0, get_score("sourness_score") - 1.0)
-
-    if "더 쓴" in text or "더 쌉쌀" in text:
-        new_vec["bitterness_score"] = min(5.0, get_score("bitterness_score") + 1.0)
-
-    if "너무 쓰" in text:
-        new_vec["bitterness_score"] = max(1.0, get_score("bitterness_score") - 1.0)
-
-    if "무거워" in text:
-        new_vec["body_score"] = max(1.0, get_score("body_score") - 1.0)
-
-    if "더 묵직" in text:
-        new_vec["body_score"] = min(5.0, get_score("body_score") + 1.0)
-
-    return new_vec

@@ -572,6 +572,16 @@ def create_final_recommendation(
     db.refresh(row)
     return row
 
+def get_final_recommendation_by_id(
+    db: Session,
+    final_recommendation_id: str | Any,
+) -> Optional[FinalRecommendation]:
+    return (
+        db.query(FinalRecommendation)
+        .filter(FinalRecommendation.final_recommendation_id == final_recommendation_id)
+        .first()
+    )
+
 
 # ============================================================
 # 11. 제조 주문 저장
