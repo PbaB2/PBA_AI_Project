@@ -135,6 +135,25 @@ def _is_slot_empty(value: Any) -> bool:
         return True
     return False
 
+# 필수 슬롯 — 추천 품질 보장을 위해 최소한 채워져야 하는 필드 (FR-06)
+REQUIRED_SLOTS: list[str] = ["strength_preference", "disliked_bases"]
+
+
+def missing_required_slots(merged_slots: dict) -> list[str]:
+    """필수 슬롯 중 비어있는 키 목록 반환. disliked_bases는 빈 리스트도 '응답함'으로 간주."""
+    missing: list[str] = []
+    for key in REQUIRED_SLOTS:
+        value = merged_slots.get(key)
+        # disliked_bases는 '없음'이라는 빈 리스트도 유효 응답으로 인정
+        if key == "disliked_bases":
+            if value is None:
+                missing.append(key)
+            continue
+        if _is_slot_empty(value):
+            missing.append(key)
+    return missing
+
+
 def _calc_effective_completion(merged_slots: dict) -> float:
     fields = [
         merged_slots.get("party_purpose"),
@@ -152,6 +171,12 @@ def _calc_effective_completion(merged_slots: dict) -> float:
     return round((filled / 10) * 100, 2)
 
 def choose_next_question(slots: dict) -> str:
+    # 필수 슬롯을 최우선으로 질문 (FR-06)
+    missing_required = set(missing_required_slots(slots))
+    if missing_required:
+        for slot_key, q in _SLOT_QUESTIONS:
+            if slot_key in missing_required:
+                return q
     for slot_key, q in _SLOT_QUESTIONS:
         if _is_slot_empty(slots.get(slot_key)):
             return q
@@ -163,12 +188,17 @@ def should_move_to_recommendation(
     user_msg: str,
 ) -> tuple[bool, str]:
     completion = _calc_effective_completion(merged_slots)
+    required_missing = missing_required_slots(merged_slots)
 
     if completion >= 80:
         return True, "slot_completion"
     if user_turn_count >= 7:
+        # 턴 한도 도달 시엔 필수 누락이어도 진행 (무한 루프 방지)
         return True, "turn_limit"
     if wants_to_skip(user_msg):
+        # 사용자가 중단 의사 표현해도 필수 슬롯 누락 상태면 한 번 더 묻는다
+        if required_missing:
+            return False, "need_required_slots"
         return True, "user_skip"
 
     return False, "continue"

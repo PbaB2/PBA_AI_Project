@@ -27,7 +27,6 @@ from app.db.crud import (
 from app.utils.config import UPLOAD_DIR
 from app.agents.preference_agent import (
     run_dialogue,
-    wants_to_skip,
     choose_next_question,
     should_move_to_recommendation,
 )
@@ -352,19 +351,6 @@ def dialogue_endpoint(
     if not guest:
         raise HTTPException(status_code=404, detail="guest_session_id not found")
 
-    # 0) 대화 히스토리 조회 (턴 수 체크용)
-    history_rows = list_dialogue_turns(db, gid)
-    user_turn_count = count_user_turns(db, gid)
-    if user_turn_count >= 7:
-        slot_row = get_preference_slot(db, gid)
-        update_guest_stage(db, gid, "READY_TO_RECOMMEND")
-        return {
-            "status": "max_turns_reached",
-            "message": "대화 한도(7회)에 도달했습니다. 추천을 진행해주세요.",
-            "should_proceed": True,
-            "completion": float(slot_row.slot_completion_score) if slot_row else 0.0,
-        }
-
     # 1) 사용자 턴 저장
     user_turn = create_dialogue_turn(
         db=db,
@@ -374,11 +360,10 @@ def dialogue_endpoint(
         extracted_slots_json=None,
     )
 
-    # 2) 현재 슬롯 상태 조회
+    # 2) 현재 슬롯 + 초기 태그 병합
     slot_row = get_preference_slot(db, gid)
     current_slots = _slot_row_to_internal_dict(slot_row)
 
-    # 2-1) 초기 태그를 슬롯에 병합 (대화 완성도에 반영)
     tag_row = get_initial_tag_response(db, gid)
     if tag_row:
         if not current_slots.get("preferred_tastes"):
@@ -388,7 +373,8 @@ def dialogue_endpoint(
         if not current_slots.get("strength_preference") and tag_row.strength_tag:
             current_slots["strength_preference"] = tag_row.strength_tag
 
-    # 3) 전체 대화 히스토리 구성
+    # 3) 대화 히스토리 구성
+    history_rows = list_dialogue_turns(db, gid)
     history = [
         {
             "speaker_role": row.speaker_role,
@@ -404,16 +390,7 @@ def dialogue_endpoint(
         slots=current_slots,
         user_msg=req.message,
     )
-
-    # 4-1) 사용자 중단 의사 감지 → should_proceed 강제 True
-    if wants_to_skip(req.message):
-        agent_result["should_proceed"] = True
-        agent_result["question"] = "알겠습니다! 지금까지 말씀해주신 정보로 추천해드릴게요."
-
     extracted_slots = agent_result.get("extracted_slots", {})
-    question = agent_result.get("question", "")
-    completion = agent_result.get("completion", 0.0)
-    should_proceed = agent_result.get("should_proceed", False)
 
     # 5) 추출된 슬롯 DB 반영
     updated_slot_row = update_preference_slots(
@@ -422,13 +399,11 @@ def dialogue_endpoint(
         extracted_slots=extracted_slots,
     )
 
+    # 6) 병합 슬롯 재구성 (초기 태그 포함)
     merged_slots = _slot_row_to_internal_dict(updated_slot_row)
-
-    # 초기 태그 다시 병합
-    tag_row = get_initial_tag_response(db, gid)
     if tag_row:
         merged_slots["preferred_tastes"] = list(dict.fromkeys(
-          (merged_slots.get("preferred_tastes") or []) + (tag_row.taste_tags_json or [])
+            (merged_slots.get("preferred_tastes") or []) + (tag_row.taste_tags_json or [])
         ))
         merged_slots["preferred_aromas"] = list(dict.fromkeys(
             (merged_slots.get("preferred_aromas") or []) + (tag_row.aroma_tags_json or [])
@@ -436,8 +411,8 @@ def dialogue_endpoint(
         if not merged_slots.get("strength_preference") and tag_row.strength_tag:
             merged_slots["strength_preference"] = tag_row.strength_tag
 
+    # 7) 추천 이동 판단
     user_turn_count = count_user_turns(db, gid)
-
     should_proceed, proceed_reason = should_move_to_recommendation(
         merged_slots=merged_slots,
         user_turn_count=user_turn_count,
@@ -455,9 +430,13 @@ def dialogue_endpoint(
             "should_proceed": True,
         }
 
+    # 8) 다음 질문 생성 + LLM 턴 저장
     question = choose_next_question(merged_slots)
-    update_guest_stage(db, gid, "COLLECTING")
-
+    if proceed_reason == "need_required_slots":
+        question = (
+            "추천 전에 한 가지만 더 확인할게요. "
+            + question
+        )
     llm_turn = create_dialogue_turn(
         db=db,
         guest_session_id=gid,
@@ -465,17 +444,7 @@ def dialogue_endpoint(
         utterance_text=question,
         extracted_slots_json=extracted_slots,
     )
-
     update_guest_stage(db, gid, "COLLECTING")
-
-    # 6) LLM 질문 턴 저장
-    llm_turn = create_dialogue_turn(
-        db=db,
-        guest_session_id=gid,
-        speaker_role="LLM",
-        utterance_text=question,
-        extracted_slots_json=extracted_slots,
-    )
 
     return {
         "status": "ok",
@@ -485,8 +454,8 @@ def dialogue_endpoint(
         "question": question,
         "extracted_slots": extracted_slots,
         "slot_state": _serialize_preference_slot(updated_slot_row) if updated_slot_row else {},
-        "completion": completion,
-        "should_proceed": should_proceed,
+        "completion": agent_result.get("completion", 0.0),
+        "should_proceed": False,
     }
 
 @router.get("/final-output/{final_recommendation_id}")

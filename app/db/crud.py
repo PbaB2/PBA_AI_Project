@@ -672,6 +672,25 @@ def list_recommended_cocktail_ids_by_guest(
     return [r.recommended_cocktail_id for r in rows]
 
 
+def get_available_ingredient_ids(db: Session) -> Optional[set[int]]:
+    """현재 재고가 충분한 ingredient_id 집합.
+
+    - InventoryItem 테이블이 비어있으면 None 반환 (필터 비활성화 = 데이터 미세팅 상태)
+    - 데이터가 있으면 is_available=True AND 현재량 >= 임계값인 ingredient_id 집합 반환
+    """
+    from app.db.models import InventoryItem
+    total = db.query(InventoryItem).count()
+    if total == 0:
+        return None
+    rows = (
+        db.query(InventoryItem.ingredient_id)
+        .filter(InventoryItem.is_available.is_(True))
+        .filter(InventoryItem.current_volume_ml >= InventoryItem.low_threshold_ml)
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
 def get_all_recipes_with_ingredients(db: Session) -> dict[int, list[tuple]]:
     """cocktail_id → [(Recipe, Ingredient)] 딕셔너리로 한 번에 로드"""
     from app.db.models import Recipe, Ingredient
